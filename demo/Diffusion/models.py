@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
+import tomesd
 from diffusers.loaders import LoraLoaderMixin
 from diffusers.models import (
     AutoencoderKL,
@@ -779,6 +779,8 @@ class UNetXLModel(BaseModel):
             print(f"[I] Load UNet pytorch model from: {unet_model_dir}")
             model_load_opts = {'torch_dtype': torch.float16} if self.fp16 else {}
             model = UNet2DConditionModel.from_pretrained(unet_model_dir, **model_load_opts).to(self.device)
+            print("apply tome patch")
+            tomesd.apply_patch(model, ratio=0.5)
         model = optimize_checkpoint(model, torch_inference)
         return model
 
