@@ -779,7 +779,8 @@ class UNetXLModel(BaseModel):
             print(f"[I] Load UNet pytorch model from: {unet_model_dir}")
             model_load_opts = {'torch_dtype': torch.float16} if self.fp16 else {}
             model = UNet2DConditionModel.from_pretrained(unet_model_dir, **model_load_opts).to(self.device)
-            tomesd.apply_patch(model, ratio=0.9, sx=4, sy=4, max_downsample=2)
+            print(dir(model))
+            tomesd.apply_patch(model, ratio=0.75)
             print("apply tome patch")
         model = optimize_checkpoint(model, torch_inference)
         return model
