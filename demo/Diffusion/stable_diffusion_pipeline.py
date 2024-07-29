@@ -86,6 +86,7 @@ class StableDiffusionPipeline:
         nvtx_profile=False,
         use_cuda_graph=False,
         vae_scaling_factor=0.18215,
+        quantization_ckpt=None,
         framework_model_dir='pytorch_model',
         controlnets=None,
         lora_scale: Optional[List[int]] = None,
@@ -141,7 +142,8 @@ class StableDiffusionPipeline:
         self.vae_scaling_factor = vae_scaling_factor
 
         self.max_batch_size = max_batch_size
-
+        
+        self.quantization_ckpt = quantization_ckpt
         self.framework_model_dir = framework_model_dir
         self.output_dir = output_dir
         for directory in [self.framework_model_dir, self.output_dir]:
@@ -433,81 +435,91 @@ class StableDiffusionPipeline:
         model_suffix = dict(zip(model_names, [lora_suffix if do_lora_merge[model_name] else '' for model_name in model_names]))
         use_int8 = dict.fromkeys(model_names, False)
         if int8:
-            assert self.pipeline_type.is_sd_xl_base(), "int8 quantization only supported for SDXL pipeline"
-            use_int8['unetxl'] = True
-            model_suffix['unetxl'] += f"-int8.l{quantization_level}.bs2.s{denoising_steps}.c{calibration_size}.p{quantization_percentile}.a{quantization_alpha}"
+            if self.pipeline_type.is_controlnet():
+                use_int8['unet'] = True
+            else:
+                assert self.pipeline_type.is_sd_xl_base(), "int8 quantization only supported for SDXL pipeline"
+                use_int8['unetxl'] = True
+                model_suffix['unetxl'] += f"-int8.l{quantization_level}.bs2.s{denoising_steps}.c{calibration_size}.p{quantization_percentile}.a{quantization_alpha}"
         onnx_path = dict(zip(model_names, [self.getOnnxPath(model_name, onnx_dir, opt=False, suffix=model_suffix[model_name]) for model_name in model_names]))
         onnx_opt_path = dict(zip(model_names, [self.getOnnxPath(model_name, onnx_dir, suffix=model_suffix[model_name]) for model_name in model_names]))
         engine_path = dict(zip(model_names, [self.getEnginePath(model_name, engine_dir, do_engine_refit[model_name], suffix=model_suffix[model_name]) for model_name in model_names]))
         weights_map_path = dict(zip(model_names, [(self.getWeightsMapPath(model_name, onnx_dir) if do_engine_refit[model_name] else None) for model_name in model_names]))
 
         for model_name, obj in self.models.items():
-            if torch_fallback[model_name]:
-                continue
-            # Export models to ONNX and save weights name mapping
-            do_export_onnx = not os.path.exists(engine_path[model_name]) and not os.path.exists(onnx_opt_path[model_name])
-            do_export_weights_map = weights_map_path[model_name] and not os.path.exists(weights_map_path[model_name])
-            if do_export_onnx or do_export_weights_map:
-                # Non-quantized ONNX export
-                if not use_int8[model_name]:
-                    obj.export_onnx(onnx_path[model_name], onnx_opt_path[model_name], onnx_opset, opt_image_height, opt_image_width, enable_lora_merge=do_lora_merge[model_name], static_shape=static_shape)
-                else:
-                    state_dict_path = self.getStateDictPath(model_name, onnx_dir, suffix=model_suffix[model_name])
-                    if not os.path.exists(state_dict_path):
-                        print(f"[I] Calibrated weights not found, generating {state_dict_path}")
-                        pipeline = obj.get_pipeline()
-                        model = pipeline.unet
-                        calibration_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'calibration-prompts.txt')
-                        calibration_prompts = load_calib_prompts(calib_batch_size, calibration_file)
-                        # TODO check size > calibration_size
-                        quant_config = get_int8_config(
-                            model, 
-                            quantization_level,
-                            quantization_alpha,
-                            quantization_percentile,
-                            denoising_steps
-                        )
-
-                        def do_calibrate(base, calibration_prompts, **kwargs):
-                            for i_th, prompts in enumerate(calibration_prompts):
-                                if i_th >= kwargs["calib_size"]:
-                                    return
-                                base(
-                                    prompt=prompts,
-                                    num_inference_steps=kwargs["n_steps"],
-                                    negative_prompt=[
-                                        "normal quality, low quality, worst quality, low res, blurry, nsfw, nude"
-                                    ]
-                                    * len(prompts),
-                                ).images
-                        
-                        def calibration_loop(unet):
-                            pipeline.model = unet
-                            do_calibrate(
-                                base=pipeline,
-                                calibration_prompts=calibration_prompts,
-                                calib_size=calibration_size // calib_batch_size,
-                                n_steps=denoising_steps,
+            if not self.quantization_ckpt:
+                if torch_fallback[model_name]:
+                    continue
+                # Export models to ONNX and save weights name mapping
+                do_export_onnx = not os.path.exists(engine_path[model_name]) and not os.path.exists(onnx_opt_path[model_name])
+                do_export_weights_map = weights_map_path[model_name] and not os.path.exists(weights_map_path[model_name])
+                if do_export_onnx or do_export_weights_map:
+                    # Non-quantized ONNX export
+                    if not use_int8[model_name]:
+                        obj.export_onnx(onnx_path[model_name], onnx_opt_path[model_name], onnx_opset, opt_image_height, opt_image_width, enable_lora_merge=do_lora_merge[model_name], static_shape=static_shape)
+                    else:
+                        state_dict_path = self.getStateDictPath(model_name, onnx_dir, suffix=model_suffix[model_name])
+                        if not os.path.exists(state_dict_path):
+                            print(f"[I] Calibrated weights not found, generating {state_dict_path}")
+                            pipeline = obj.get_pipeline()
+                            model = pipeline.unet
+                            calibration_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'calibration-prompts.txt')
+                            calibration_prompts = load_calib_prompts(calib_batch_size, calibration_file)
+                            # TODO check size > calibration_size
+                            quant_config = get_int8_config(
+                                model, 
+                                quantization_level,
+                                quantization_alpha,
+                                quantization_percentile,
+                                denoising_steps
                             )
 
-                        print(f"[I] Performing int8 calibration for {calibration_size} steps.")
-                        mtq.quantize(model, quant_config, forward_loop=calibration_loop)
-                        mto.save(model, state_dict_path)
+                            def do_calibrate(base, calibration_prompts, **kwargs):
+                                for i_th, prompts in enumerate(calibration_prompts):
+                                    if i_th >= kwargs["calib_size"]:
+                                        return
+                                    base(
+                                        prompt=prompts,
+                                        num_inference_steps=kwargs["n_steps"],
+                                        negative_prompt=[
+                                            "normal quality, low quality, worst quality, low res, blurry, nsfw, nude"
+                                        ]
+                                        * len(prompts),
+                                    ).images
+                            
+                            def calibration_loop(unet):
+                                pipeline.model = unet
+                                do_calibrate(
+                                    base=pipeline,
+                                    calibration_prompts=calibration_prompts,
+                                    calib_size=calibration_size // calib_batch_size,
+                                    n_steps=denoising_steps,
+                                )
 
-                    print(f"[I] Generating quantized ONNX model: {onnx_opt_path[model_name]}")
-                    if not os.path.exists(onnx_path[model_name]):
+                            print(f"[I] Performing int8 calibration for {calibration_size} steps.")
+                            mtq.quantize(model, quant_config, forward_loop=calibration_loop)
+                            mto.save(model, state_dict_path)
+            else:
+                print(f"[I] Generating quantized ONNX model: {onnx_opt_path[model_name]}")
+                if not os.path.exists(onnx_path[model_name]):
+                    if self.pipeline_type.is_controlnet():
+                        model = obj.get_model()
+                        mto.restore(model.unet, state_dict_path)
+                        quantize_lvl(model.unet, quantization_level) 
+                        mtq.disable_quantizer(model.unet, filter_func)
+                    else:
                         model = obj.get_model()
                         mto.restore(model, state_dict_path)
                         quantize_lvl(model, quantization_level) 
                         mtq.disable_quantizer(model, filter_func)
-                        model.to(torch.float32).to("cpu") # QDQ needs to be in FP32
-                        # WAR to enable ONNX export of quantized UNet
-                        obj.device="cpu"
-                        obj.fp16=False
-                    else:
-                        model = None
-                    obj.export_onnx(onnx_path[model_name], onnx_opt_path[model_name], onnx_opset, opt_image_height, opt_image_width, custom_model=model)
-                    obj.fp16=True # Part of WAR, UNET obj.fp16 defaults to True so it is safe to reset this way
+                    model.to(torch.float32).to("cpu") # QDQ needs to be in FP32
+                    # WAR to enable ONNX export of quantized UNet
+                    obj.device="cpu"
+                    obj.fp16=False
+                else:
+                    model = None
+                obj.export_onnx(onnx_path[model_name], onnx_opt_path[model_name], onnx_opset, opt_image_height, opt_image_width, custom_model=model)
+                obj.fp16=True # Part of WAR, UNET obj.fp16 defaults to True so it is safe to reset this way
             
             # FIXME do_export_weights_map needs ONNX graph
             if do_export_weights_map:

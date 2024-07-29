@@ -438,6 +438,7 @@ def add_arguments(parser):
     parser.add_argument('--onnx-dir', default='onnx', help="Output directory for ONNX export")
 
     # Framework model ckpt
+    parser.add_argument('--quantization-checkpoint', default='modelopt quantization ckpt', help="modelopt quantization checkpoint")
     parser.add_argument('--framework-model-dir', default='pytorch_model', help="Directory for HF saved models")
 
     # TensorRT engine build
@@ -472,9 +473,6 @@ def process_pipeline_args(args):
 
     if args.use_cuda_graph and (not args.build_static_batch or args.build_dynamic_shape):
         raise ValueError(f"Using CUDA graph requires static dimensions. Enable `--build-static-batch` and do not specify `--build-dynamic-shape`")
-
-    if args.int8 and not args.version.startswith('xl'):
-        raise ValueError(f"int8 quantization only supported for SDXL pipeline.")
 
     if args.lora_scale:
         for lora_scale in (lora_scale for lora_scale in args.lora_scale if not 0 <= lora_scale <= 1):
